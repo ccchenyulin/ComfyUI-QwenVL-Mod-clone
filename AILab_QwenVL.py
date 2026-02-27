@@ -153,21 +153,21 @@ SYSTEM_PROMPTS = {}
 PRESET_PROMPTS: list[str] = ["Describe this image in detail."]
 
 TOOLTIPS = {
-    "model_name": "Pick the Qwen-VL checkpoint. First run downloads weights into models/LLM/Qwen-VL, so leave disk space.",
-    "quantization": "Precision vs VRAM. FP16 gives the best quality if memory allows; 8-bit suits 8–16 GB GPUs; 4-bit fits 6 GB or lower but is slower.",
-    "attention_mode": "auto tries FlashAttention 2 when installed and falls back to SDPA. SDPA is stable and recommended. Only override when debugging attention backends.",
-    "preset_prompt": "Built-in instruction describing how Qwen-VL should analyze the media input.",
-    "custom_prompt": "Additional user input that gets combined with the preset template. Leave empty to use only the template.",
-    "max_tokens": "Maximum number of new tokens to decode. Larger values yield longer answers but consume more time and memory.",
-    "keep_model_loaded": "Keeps the model resident in VRAM/RAM after the run so the next prompt skips loading.",
-    "seed": "Seed controlling sampling and frame picking; reuse it to reproduce results.",
-    "use_torch_compile": "Enable torch.compile('reduce-overhead') on supported CUDA/Torch 2.1+ builds for extra throughput after the first compile.",
-    "device": "Choose where to run the model: auto, cpu, mps, or cuda:x for multi-GPU systems.",
-    "temperature": "Sampling randomness when num_beams == 1. 0.2–0.4 is focused, 0.7+ is creative.",
-    "top_p": "Nucleus sampling cutoff when num_beams == 1. Lower values keep only top tokens; 0.9–0.95 allows more variety.",
-    "num_beams": "Beam-search width. Values >1 disable temperature/top_p and trade speed for more stable answers.",
-    "repetition_penalty": "Values >1 (e.g., 1.1–1.3) penalize repeated phrases; 1.0 leaves logits untouched.",
-    "frame_count": "Number of frames extracted from video inputs before prompting Qwen-VL. More frames provide context but cost time.",
+    "model_name": "选择 Qwen-VL 模型权重。首次运行会自动下载权重到 models/LLM/Qwen-VL 目录，请预留磁盘空间。",
+    "quantization": "精度与显存的平衡。显存允许时 FP16 质量最佳；8-bit 适合 8–16 GB 显存的 GPU；4-bit 可在 6 GB 或更低显存下运行，但速度较慢。",
+    "attention_mode": "auto 模式会优先尝试 FlashAttention 2，不可用时回退到 SDPA。SDPA 稳定且推荐。仅在调试注意力后端时覆盖此设置。",
+    "preset_prompt": "内置指令模板，用于描述 Qwen-VL 应如何分析媒体输入。",
+    "custom_prompt": "用户附加输入，将与预设模板组合使用。留空则仅使用模板。",
+    "max_tokens": "解码的最大新 token 数。值越大，回答越长，但消耗的时间和显存也越多。",
+    "keep_model_loaded": "运行后将模型保留在显存/内存中，下次提示时跳过加载步骤。",
+    "seed": "控制采样和帧选取的随机种子；复用时可重现结果。",
+    "use_torch_compile": "在支持的 CUDA/Torch 2.1+ 版本上启用 torch.compile('reduce-overhead')，首次编译后可提升吞吐量。",
+    "device": "选择模型运行设备：auto、cpu、mps，或多 GPU 系统使用 cuda:x。",
+    "temperature": "当 num_beams == 1 时的采样随机性。0.2–0.4 更聚焦，0.7+ 更有创意。",
+    "top_p": "当 num_beams == 1 时的核采样阈值。控制 token 采样范围，较低时仅保留高概率 token，输出保守 token；0.9–0.95 允许更多样性。",
+    "num_beams": "束搜索宽度。值 >1 会禁用 temperature/top_p，以速度换取更稳定的答案。",
+    "repetition_penalty": "值 >1（如 1.1–1.3）会惩罚重复短语；1.0 不做处理。",
+    "frame_count": "在提示 Qwen-VL 前从视频输入中提取的帧数。帧数越多，上下文越丰富，但耗时也越长。",
 }
 
 class Quantization(str, Enum):
@@ -488,13 +488,29 @@ class QwenVLBase:
             # 量化模式：保持原逻辑
             _, target_dtype = quantization_config(model_name, quant)
 
+        # --- 优化：为高束宽添加显存限制和智能 Offload ---
+        max_memory = None
+        if torch.cuda.is_available():
+            # 获取当前 GPU 总显存
+            total_vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            # 策略：为 KV Cache 预留 30% 显存，剩下的给模型权重
+            # 你也可以手动指定，例如 {"cuda:0": "8GiB", "cpu": "32GiB"}
+            max_memory = {
+                0: f"{int(total_vram * 0.57)}GiB", # 模型权重最多用 60% 显存
+                "cpu": "64GiB" # 剩下的卸载到 CPU
+            }
+            print(f"[QwenVL] 🧠 高束宽显存保护模式：限制模型权重使用 {int(total_vram * 0.6)}GB")
+
         load_kwargs = {
             "device_map": device_map,
             "torch_dtype": target_dtype,
             "attn_implementation": attn_impl,
             "use_safetensors": True,
-            "low_cpu_mem_usage": True, # 优化：低内存加载模式
+            "low_cpu_mem_usage": True,
             "trust_remote_code": True,
+            "max_memory": max_memory, # 新增：显存限制
+            "offload_folder": "offload", # 新增：临时 offload 目录
+            "offload_state_dict": True, # 新增：加速 offload
         }
             
         if quant_config:
