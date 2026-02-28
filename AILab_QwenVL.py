@@ -155,7 +155,7 @@ PRESET_PROMPTS: list[str] = ["Describe this image in detail."]
 TOOLTIPS = {
     "model_name": "选择 Qwen-VL 模型权重。首次运行会自动下载权重到 models/LLM/Qwen-VL 目录，请预留磁盘空间。",
     "quantization": "精度与显存的平衡。显存允许时 FP16 质量最佳；8-bit 适合 8–16 GB 显存的 GPU；4-bit 可在 6 GB 或更低显存下运行，但速度较慢。",
-    "attention_mode": "auto 模式会优先尝试 FlashAttention 2，不可用时回退到 SDPA。SDPA 稳定且推荐。仅在调试注意力后端时覆盖此设置。",
+    "attention_mode": "auto 模式会优先尝试 SageAttention → FlashAttention 2 → SDPA。SageAttention 推荐用于 RTX 40 系列及更新 GPU。",
     "preset_prompt": "内置指令模板，用于描述 Qwen-VL 应如何分析媒体输入。",
     "custom_prompt": "用户附加输入，将与预设模板组合使用。留空则仅使用模板。",
     "max_tokens": "解码的最大新 token 数。值越大，回答越长，但消耗的时间和显存也越多。",
@@ -186,7 +186,8 @@ class Quantization(str, Enum):
                 return item
         raise ValueError(f"Unsupported quantization: {value}")
 
-ATTENTION_MODES = ["auto", "flash_attention_2", "sdpa"]
+# 优化：添加 SageAttention 到注意力模式列表
+ATTENTION_MODES = ["auto", "sage", "flash_attention_2", "sdpa"]
 
 def load_model_configs():
     global HF_VL_MODELS, HF_TEXT_MODELS, HF_ALL_MODELS, SYSTEM_PROMPTS, PRESET_PROMPTS
@@ -311,6 +312,20 @@ def normalize_device_choice(device: str) -> str:
 
     return "cpu"
 
+# 优化：新增 SageAttention 检测函数
+def sage_attn_available():
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    # 支持的架构：SM80 (A100), SM86 (30系), SM89 (40系), SM90 (H100), SM120 (Blackwell)
+    if (major, minor) not in [(8, 0), (8, 6), (8, 9), (9, 0), (12, 0)]:
+        return False
+    try:
+        import sageattention  # noqa: F401
+        return True
+    except Exception:
+        return False
+
 def flash_attn_available():
     if not torch.cuda.is_available():
         return False
@@ -332,14 +347,22 @@ def flash_attn_available():
 
     return True
 
+# 优化：更新注意力模式解析逻辑，优先使用 SageAttention
 def resolve_attention_mode(mode):
     if mode == "sdpa":
         return "sdpa"
+    if mode == "sage":
+        if sage_attn_available():
+            return "sage"
+        print("[QwenVL] SageAttention forced but unavailable, falling back to FlashAttention")
     if mode == "flash_attention_2":
         if flash_attn_available():
             return "flash_attention_2"
         print("[QwenVL] Flash-Attn forced but unavailable, falling back to SDPA")
         return "sdpa"
+    # Auto模式优先级：Sage → Flash → SDPA
+    if sage_attn_available():
+        return "sage"
     if flash_attn_available():
         return "flash_attention_2"
     return "sdpa"
@@ -409,10 +432,15 @@ def quantization_config(model_name, quantization):
             bnb_4bit_compute_dtype=torch.float16,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,
+            llm_int8_enable_fp32_cpu_offload=True,  # 新增：允许CPU Offload
         )
         return cfg, None
     if quantization == Quantization.Q8:
-        return BitsAndBytesConfig(load_in_8bit=True), None
+        return BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_enable_fp32_cpu_offload=True,  # 新增：关键修复！允许CPU Offload
+            llm_int8_threshold=6.0,  # 可以适当降低这个阈值来减少GPU压力
+        ), None
     return None, torch.float16 if torch.cuda.is_available() else torch.float32
 
 class QwenVLBase:
@@ -433,6 +461,15 @@ class QwenVLBase:
         print(f"[QwenVL] Node on {self.device_info['device_type']}, bf16 support: {self.bf16_support}")
 
     def clear(self):
+        # 清理SageAttention的monkey patch
+        try:
+            import torch.nn.functional as F
+            if hasattr(self, '_original_sdpa'):
+                F.scaled_dot_product_attention = self._original_sdpa
+                print("[QwenVL] Restored original scaled_dot_product_attention")
+        except:
+            pass
+        
         self.model = None
         self.processor = None
         self.tokenizer = None
@@ -488,29 +525,42 @@ class QwenVLBase:
             # 量化模式：保持原逻辑
             _, target_dtype = quantization_config(model_name, quant)
 
-        # --- 优化：为高束宽添加显存限制和智能 Offload ---
+        # --- 优化1：动态计算 max_memory（针对4080S 16G + 8B模型深度优化）---
         max_memory = None
+        offload_folder = None
         if torch.cuda.is_available():
-            # 获取当前 GPU 总显存
             total_vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
-            # 策略：为 KV Cache 预留 30% 显存，剩下的给模型权重
-            # 你也可以手动指定，例如 {"cuda:0": "8GiB", "cpu": "32GiB"}
+            # 先强制清理一次显存，确保计算准确
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            
+            used_vram = torch.cuda.memory_allocated(0) / 1024**3
+            
+            # 针对8B模型的特殊策略：
+            # - 给KV Cache和中间激活值留0.5G固定余量（8B模型需要更多）
+            # - 剩余空间的80%给模型权重
+            available_for_model = (total_vram - used_vram - 0.5) * 0.80
+            # 最低保证3G
+            model_vram = max(3, int(available_for_model))
+            
             max_memory = {
-                0: f"{int(total_vram * 0.57)}GiB", # 模型权重最多用 60% 显存
-                "cpu": "64GiB" # 剩下的卸载到 CPU
+                0: f"{model_vram}GiB",
+                "cpu": "64GiB"
             }
-            print(f"[QwenVL] 🧠 高束宽显存保护模式：限制模型权重使用 {int(total_vram * 0.6)}GB")
+            offload_folder = "offload"
+            print(f"[QwenVL] 🧠 动态显存分配（8B模型优化）：模型权重限制为 {model_vram}GB（当前已用 {used_vram:.1f}GB，总显存 {total_vram:.1f}GB）")
 
         load_kwargs = {
             "device_map": device_map,
             "torch_dtype": target_dtype,
-            "attn_implementation": attn_impl,
+            "attn_implementation": "sdpa" if attn_impl == "sage" else attn_impl,  # SageAttention需要特殊处理
             "use_safetensors": True,
             "low_cpu_mem_usage": True,
             "trust_remote_code": True,
-            "max_memory": max_memory, # 新增：显存限制
-            "offload_folder": "offload", # 新增：临时 offload 目录
-            "offload_state_dict": True, # 新增：加速 offload
+            "max_memory": max_memory,
+            "offload_folder": offload_folder,
+            "offload_state_dict": True if offload_folder else False,
         }
             
         if quant_config:
@@ -519,6 +569,29 @@ class QwenVLBase:
         print(f"[QwenVL] Loading {model_name} ({quant.value}, attn={attn_impl}, device_map={device_map})")
         self.model = AutoModelForVision2Seq.from_pretrained(model_path, **load_kwargs).eval()
                 
+        # --- 优化2：SageAttention 2.2.0 集成（正确方式）---
+        if attn_impl == "sage":
+            try:
+                import torch.nn.functional as F
+                from sageattention import sageattn
+                
+                # 保存原始的scaled_dot_product_attention
+                self._original_sdpa = F.scaled_dot_product_attention
+                
+                # 替换为SageAttention
+                F.scaled_dot_product_attention = sageattn
+                
+                print("[QwenVL] ✅ SageAttention 2.2.0 applied successfully (monkey patch)")
+            except Exception as e:
+                print(f"[QwenVL] ⚠️ SageAttention init failed: {e}, using SDPA instead")
+                # 如果失败，确保回退到原始SDPA
+                try:
+                    import torch.nn.functional as F
+                    if hasattr(self, '_original_sdpa'):
+                        F.scaled_dot_product_attention = self._original_sdpa
+                except:
+                    pass
+        
         self.model.config.use_cache = True
         if hasattr(self.model, "generation_config"):
             self.model.generation_config.use_cache = True
@@ -554,6 +627,10 @@ class QwenVLBase:
         num_beams,
         repetition_penalty,
     ):
+        # --- 优化3：生成前显存清理 ---
+        gc.collect()
+        torch.cuda.empty_cache()
+        
         conversation = [{"role": "user", "content": []}]
         if image is not None:
             conversation[0]["content"].append({"type": "image", "image": self.tensor_to_pil(image)})
@@ -581,22 +658,34 @@ class QwenVLBase:
         stop_tokens = [self.tokenizer.eos_token_id]
         if hasattr(self.tokenizer, "eot_id") and self.tokenizer.eot_id is not None:
             stop_tokens.append(self.tokenizer.eot_id)
+        
+        # --- 优化4：更轻量的生成配置 ---
         kwargs = {
             "max_new_tokens": max_tokens,
             "repetition_penalty": repetition_penalty,
             "num_beams": num_beams,
             "eos_token_id": stop_tokens,
             "pad_token_id": self.tokenizer.pad_token_id,
+            "use_cache": True,
         }
         if num_beams == 1:
             kwargs.update({"do_sample": True, "temperature": temperature, "top_p": top_p})
         else:
             kwargs["do_sample"] = False
+        
         outputs = self.model.generate(**model_inputs, **kwargs)
+        
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        
         input_len = model_inputs["input_ids"].shape[-1]
         text = self.tokenizer.decode(outputs[0, input_len:], skip_special_tokens=True)
+        
+        # --- 优化5：生成后即时清理 ---
+        del model_inputs, processed, conversation, outputs
+        gc.collect()
+        torch.cuda.empty_cache()
+        
         return text.strip()
 
     def run(self, model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, attention_mode, use_torch_compile, device, keep_last_prompt=False):
@@ -692,13 +781,13 @@ class AILab_QwenVL(QwenVLBase):
         return {
             "required": {
                 "model_name": (models, {"default": default_model, "tooltip": TOOLTIPS["model_name"]}),
-                "quantization": (Quantization.get_values(), {"default": Quantization.FP16.value, "tooltip": TOOLTIPS["quantization"]}),
+                "quantization": (Quantization.get_values(), {"default": Quantization.Q8.value, "tooltip": TOOLTIPS["quantization"]}),  # 优化：默认8-bit
                 "attention_mode": (ATTENTION_MODES, {"default": "auto", "tooltip": TOOLTIPS["attention_mode"]}),
                 "preset_prompt": (prompts, {"default": default_prompt, "tooltip": TOOLTIPS["preset_prompt"]}),
                 "custom_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": TOOLTIPS["custom_prompt"]}),
-                "max_tokens": ("INT", {"default": 512, "min": 64, "max": 2048, "tooltip": TOOLTIPS["max_tokens"]}),
+                "max_tokens": ("INT", {"default": 512, "min": 64, "max": 1024, "tooltip": TOOLTIPS["max_tokens"]}),  # 优化：降低默认max_tokens
                 "keep_model_loaded": ("BOOLEAN", {"default": True, "tooltip": TOOLTIPS["keep_model_loaded"]}),
-                "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1, "tooltip": TOOLTIPS["seed"] + "\n\n💡 Cache Info: Prompts are cached automatically. Use the same inputs (model, preset, custom prompt, image/video) to reuse cached prompts and avoid regeneration.\n\n🔒 Fixed Seed Mode: Set seed = 1 to ignore image/video changes and only use text-based caching. Perfect for keeping the same prompt regardless of media input variations."}),
+                "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1, "tooltip": TOOLTIPS["seed"]}),
             },
             "optional": {
                 "image": ("IMAGE",),
@@ -730,20 +819,20 @@ class AILab_QwenVL_Advanced(QwenVLBase):
         return {
             "required": {
                 "model_name": (models, {"default": default_model, "tooltip": TOOLTIPS["model_name"]}),
-                "quantization": (Quantization.get_values(), {"default": Quantization.FP16.value, "tooltip": TOOLTIPS["quantization"]}),
+                "quantization": (Quantization.get_values(), {"default": Quantization.Q8.value, "tooltip": TOOLTIPS["quantization"]}),  # 优化：默认8-bit
                 "attention_mode": (ATTENTION_MODES, {"default": "auto", "tooltip": TOOLTIPS["attention_mode"]}),
                 "use_torch_compile": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["use_torch_compile"]}),
                 "device": (device_options, {"default": "auto", "tooltip": TOOLTIPS["device"]}),
                 "preset_prompt": (prompts, {"default": default_prompt, "tooltip": TOOLTIPS["preset_prompt"]}),
                 "custom_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": TOOLTIPS["custom_prompt"]}),
-                "max_tokens": ("INT", {"default": 512, "min": 64, "max": 4096, "tooltip": TOOLTIPS["max_tokens"]}),
+                "max_tokens": ("INT", {"default": 512, "min": 64, "max": 2048, "tooltip": TOOLTIPS["max_tokens"]}),  # 优化：降低默认max_tokens
                 "temperature": ("FLOAT", {"default": 0.6, "min": 0.1, "max": 1.0, "tooltip": TOOLTIPS["temperature"]}),
                 "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "tooltip": TOOLTIPS["top_p"]}),
                 "num_beams": ("INT", {"default": 1, "min": 1, "max": 8, "tooltip": TOOLTIPS["num_beams"]}),
                 "repetition_penalty": ("FLOAT", {"default": 1.2, "min": 0.5, "max": 2.0, "tooltip": TOOLTIPS["repetition_penalty"]}),
                 "frame_count": ("INT", {"default": 16, "min": 1, "max": 64, "tooltip": TOOLTIPS["frame_count"]}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True, "tooltip": TOOLTIPS["keep_model_loaded"]}),
-                "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1, "tooltip": TOOLTIPS["seed"] + "\n\n💡 Cache Info: Prompts are cached automatically. Use the same inputs (model, preset, custom prompt, image/video) to reuse cached prompts and avoid regeneration.\n\n🔒 Fixed Seed Mode: Set seed = 1 to ignore image/video changes and only use text-based caching. Perfect for keeping the same prompt regardless of media input variations."}),
+                "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1, "tooltip": TOOLTIPS["seed"]}),
                 "keep_last_prompt": ("BOOLEAN", {"default": False, "tooltip": "Keep the last generated prompt instead of creating a new one"}),
             },
             "optional": {
